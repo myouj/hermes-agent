@@ -67,6 +67,14 @@ from hermes_cli.banner import _format_context_length, format_banner_version_labe
 
 _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
+# Enhanced animation frames for different spinner states
+# Thinking state: brain/sparkle themed
+_THINKING_FRAMES = ("🧠", "💭", "💡", "✨", "💫", "🌟", "💡", "💭")
+# Tool execution state: rotating arrows for active processing
+_TOOL_FRAMES = ("◐", "◑", "◒", "◓", "◐", "◑", "◒", "◓")
+# Agent running state: heartbeat/pulse themed
+_AGENT_FRAMES = ("♡", "♥", "❤", "♥", "♡", "♥", "❤", "♥")
+
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -1821,9 +1829,14 @@ class HermesCLI:
         self._secret_state = None
         self._secret_deadline = 0
         self._spinner_text: str = ""  # thinking spinner text for TUI
+        self._spinner_type: str = ""  # "thinking" | "tool" | "agent" — for style differentiation
         self._tool_start_time: float = 0.0  # monotonic timestamp when current tool started (for live elapsed)
+        self._tool_current_args: dict = {}  # current tool args for richer display
+        self._tool_current_preview: str = ""  # current tool preview label
         self._pending_tool_info: dict = {}  # function_name -> list of (preview, args) for stacked scrollback
         self._last_scrollback_tool: str = ""  # last tool name printed to scrollback (for "new" dedup)
+        self._tool_call_count: int = 0  # total tool calls in current agent turn
+        self._tool_call_index: int = 0  # current tool index in current agent turn
         self._command_running = False
         self._command_status = ""
         self._attached_images: list[Path] = []
@@ -2235,7 +2248,10 @@ class HermesCLI:
         if not text:
             self._flush_reasoning_preview(force=True)
         self._spinner_text = text or ""
+        self._spinner_type = "thinking"  # Mark as thinking state for styling
         self._tool_start_time = 0.0  # clear tool timer when switching to thinking
+        self._tool_current_args = {}
+        self._tool_current_preview = ""
         self._invalidate()
 
     # ── Streaming display ────────────────────────────────────────────────
@@ -6610,6 +6626,7 @@ class HermesCLI:
         if event_type == "tool.completed":
             import time as _time
             self._tool_start_time = 0.0
+            self._tool_call_index += 1  # Move to next tool in sequence
             # Print stacked scrollback line for "all" / "new" modes
             if function_name and self.tool_progress_mode in ("all", "new"):
                 duration = kwargs.get("duration", 0.0)
@@ -6634,6 +6651,14 @@ class HermesCLI:
                     pass
             self._invalidate()
             return
+
+        if event_type == "agent.thinking":
+            # New agent turn started - reset tool counter
+            self._tool_call_count = 0
+            self._tool_call_index = 0
+            self._on_thinking(preview or "thinking...")
+            return
+
         if event_type != "tool.started":
             return
         if function_name and not function_name.startswith("_"):
@@ -6645,6 +6670,13 @@ class HermesCLI:
             _pl = get_tool_preview_max_len()
             if _pl > 0 and len(label) > _pl:
                 label = label[:_pl - 3] + "..."
+            # Track tool call sequence
+            self._tool_call_count += 1
+            self._tool_call_index = self._tool_call_count
+            # Store current tool info for richer display
+            self._spinner_type = "tool"
+            self._tool_current_args = function_args if function_args is not None else {}
+            self._tool_current_preview = label
             self._spinner_text = f"{emoji} {label}"
             self._tool_start_time = _time.monotonic()
             # Store args for stacked scrollback line on completion
@@ -8909,18 +8941,54 @@ class HermesCLI:
             txt = cli_ref._spinner_text
             if not txt:
                 return []
-            # Append live elapsed timer when a tool is running
+            import time as _time
+            # Dynamic animation frames based on spinner type
+            spinner_type = getattr(cli_ref, '_spinner_type', 'tool')
             t0 = cli_ref._tool_start_time
+            elapsed = _time.monotonic() - t0 if t0 > 0 else 0.0
+            elapsed_str = ""
             if t0 > 0:
-                import time as _time
-                elapsed = _time.monotonic() - t0
                 if elapsed >= 60:
                     _m, _s = int(elapsed // 60), int(elapsed % 60)
                     elapsed_str = f"{_m}m {_s}s"
                 else:
                     elapsed_str = f"{elapsed:.1f}s"
-                return [('class:hint', f'  {txt}  ({elapsed_str})')]
-            return [('class:hint', f'  {txt}')]
+
+            # Different animation frames for different states
+            if spinner_type == "thinking":
+                # Thinking: use brain/sparkle animation
+                frame_idx = int(_time.monotonic() * 4) % len(_THINKING_FRAMES)
+                frame = _THINKING_FRAMES[frame_idx]
+                prefix = f"{frame}"
+                if elapsed_str:
+                    suffix = f" · {elapsed_str}"
+                else:
+                    suffix = ""
+                return [('class:hint', f'  {prefix} {txt}{suffix}')]
+            elif spinner_type == "tool":
+                # Tool execution: use spinning dots with tool count
+                frame_idx = int(_time.monotonic() * 8) % len(_TOOL_FRAMES)
+                frame = _TOOL_FRAMES[frame_idx]
+                tool_idx = getattr(cli_ref, '_tool_call_index', 0)
+                tool_total = getattr(cli_ref, '_tool_call_count', 0)
+                if tool_total > 1:
+                    tool_info = f" [{tool_idx}/{tool_total}]"
+                else:
+                    tool_info = ""
+                if elapsed_str:
+                    suffix = f" · {elapsed_str}"
+                else:
+                    suffix = ""
+                return [('class:hint', f'  {frame} {txt}{tool_info}{suffix}')]
+            else:
+                # Agent running: default animation
+                frame_idx = int(_time.monotonic() * 6) % len(_AGENT_FRAMES)
+                frame = _AGENT_FRAMES[frame_idx]
+                if elapsed_str:
+                    suffix = f" · {elapsed_str}"
+                else:
+                    suffix = ""
+                return [('class:hint', f'  {frame} {txt}{suffix}')]
 
         def get_spinner_height():
             return cli_ref._spinner_widget_height()
